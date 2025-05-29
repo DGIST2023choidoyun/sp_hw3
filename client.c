@@ -25,7 +25,6 @@
 #define CLOSE(fd) close(fd);
 #endif
 
-#define DEBUG
 #ifdef DEBUG
 #define LOG(msg)                    printf("%s", msg)
 #else
@@ -111,16 +110,28 @@ int main(int argc, char* argv[]) {
     if (SAME_STR(req.type, "register_ack")) {
         LOG("register ack\n");
 
-        RECV_TO(len, socket, buffer);
+        while (1) {
+            LOG("fetching...\n");
+            RECV_TO(len, socket, buffer);
 
-        parsing(buffer, &req);
+            parsing(buffer, &req);
+            printf("%s %s %s\n", buffer, req.type, req.first_player);
 
-        if (SAME_STR(req.type, "game_start") && !SAME_STR(req.players[0], "") && !SAME_STR(req.players[1], "") && !SAME_STR(req.first_player, "")) {
-            LOG("server: game start\n");
+            int i, j;
+            for (i = 0; i < 8; i++) {
+                for (j = 0; j < 8; j++) {
+                    printf("%d ", req.board[i][j]);
+                }
+            }
 
-            while(1);
+            if (SAME_STR(req.type, "game_start") && !SAME_STR(req.players[0], "") && !SAME_STR(req.players[1], "") && !SAME_STR(req.first_player, "")) {
+                LOG("server: game start\n");
+                break;
+            }
         }
     }
+
+     while(1);
 
 
     return 0;
@@ -188,7 +199,7 @@ bool registerPlayer(const int sockfd, const char* username) {
 
 char* stringfy(const Request* obj) {
     static char buffer[PAYLOAD_BUFFER];
-    char boardString[274] = "[";
+    char boardString[512] = "[";
     char scoresString[NAME_LEN] = "";
 
     // board
@@ -196,7 +207,10 @@ char* stringfy(const Request* obj) {
     for (i = 0; i < 8; i++) {
         strcat(boardString, "[");
         for (j = 0; j < 8; j++) {
-            sprintf(boardString, "\"%c\"%c", obj->board[i][j], (j < 7 ? "," : ""));
+            char temp[5];
+            char ch = obj->board[i][j];
+            sprintf(temp, "\"%c\"%s", ch == 0 ? '.' : ch, (j < 7 ? "," : ""));
+            strcat(boardString, temp);
         }
         strcat(boardString, "]");
         if (i < 7)
@@ -208,7 +222,7 @@ char* stringfy(const Request* obj) {
     sprintf(scoresString, "{\"%s\":%d,\"%s\":%d}", obj->scores.username[0], obj->scores.score[0], obj->scores.username[1], obj->scores.score[1]);
 
     sprintf(buffer, 
-        "{\"type\":\"%s\",\"username\":\"%s\",\"sx\":%d,\"sy\":%d,\"tx\":%d,\"ty\":%d,\"players\":[\"%s\",\"%s\"],\"first_player\":\"%s\",\"board\":%s,\"timeout\":%.1f,\"scores\":{%s},\"next_player\":\"%s\",\"reason\":\"%s\"}\n", // newline needed
+        "{\"type\":\"%s\",\"username\":\"%s\",\"sx\":%d,\"sy\":%d,\"tx\":%d,\"ty\":%d,\"players\":[\"%s\",\"%s\"],\"first_player\":\"%s\",\"board\":%s,\"timeout\":%.1f,\"scores\":%s,\"next_player\":\"%s\",\"reason\":\"%s\"}\n", // newline needed
         obj->type,
         obj->username,
         obj->sx, obj->sy, obj->tx, obj->ty,
@@ -225,14 +239,16 @@ char* stringfy(const Request* obj) {
 }
 
 void parsing(const char* json, Request* out) {
-    char boardFormat[256] = "[";
-    char format[1024] = "{\"type\":\"%%31[^\"]\",\"username\":\"%%255[^\"]\",\"sx\":%%d,\"sy\":%%d,\"tx\":%%d,\"ty\":%%d,\"players\":[\"%%255[^\"]\",\"%%255[^\"]\"],\"first_player\":\"%%255[^\"]\",\"board\":";
+    char boardFormat[600] = "[";
+    char format[1024] = "{\"type\":\"%31[^\"]\",\"username\":\"%255[^\"]\",\"sx\":%d,\"sy\":%d,\"tx\":%d,\"ty\":%d,\"players\":[\"%255[^\"]\",\"%255[^\"]\"],\"first_player\":\"%255[^\"]\",\"board\":";
 
     int i, j;
-    for (i = 0; i < 8; i++) {
+    for (int i = 0; i < 8; i++) {
         strcat(boardFormat, "[");
-        for (j = 0; j < 8; j++) {
-            sprintf(boardFormat, "\"%%1[^\"]\"%c", (j < 7 ? "," : ""));
+        for (int j = 0; j < 8; j++) {
+            char temp[10];
+            sprintf(temp, "\"%%1[^\"]\"%s", (j < 7 ? "," : ""));
+            strcat(boardFormat, temp);
         }
         strcat(boardFormat, "]");
         if (i < 7)
@@ -241,16 +257,32 @@ void parsing(const char* json, Request* out) {
     strcat(boardFormat, "]");
 
     strcat(format, boardFormat);
-    strcat(format, ",\"timeout\":%%f,\"scores\":{\"%%255[^\"]\":%%d,\"%%255[^\"]\":%%d},\"next_player\":\"%%255[^\"]\",\"reason\":\"%%31[^\"]\"}");
+    strcat(format, ",\"timeout\":%f,\"scores\":{\"%255[^\"]\":%d,\"%255[^\"]\":%d},\"next_player\":\"%255[^\"]\",\"reason\":\"%31[^\"]\"}");
 
-    sscanf(json, format,
+    printf("form:%s\n", format);
+
+    sscanf(json, "{\"type\":\"%31[^\"]\",\"username\":\"%255[^\"]\",\"sx\":%d,\"sy\":%d,\"tx\":%d,\"ty\":%d,\"players\":[\"%255[^\"]\",\"%255[^\"]\"],\"first_player\":\"%255[^\"]\",\"board\":[[\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\"],\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\"],[\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\"],\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\"],[\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\"],\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\"],[\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\"],\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\"],[\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\"],\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\"],[\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\"],\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\"],[\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\"],\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\"],[\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\"],\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\",\"%1[^\"]\"]],\"timeout\":%f,\"scores\":{\"%255[^\"]\":%d,\"%255[^\"]\":%d},\"next_player\":\"%255[^\"]\",\"reason\":\"%31[^\"]\"}",
         out->type,
         out->username,
         &out->sx, &out->sy, &out->tx, &out->ty,
         out->players[0], out->players[1],
         out->first_player,
-        out->board[0], out->board[1], out->board[2], out->board[3],
-        out->board[4], out->board[5], out->board[6], out->board[7],
+        out->board[0][0], out->board[0][1], out->board[0][2], out->board[0][3],
+        out->board[0][4], out->board[0][5], out->board[0][6], out->board[0][7],
+        out->board[1][0], out->board[1][1], out->board[1][2], out->board[1][3],
+        out->board[1][4], out->board[1][5], out->board[1][6], out->board[1][7],
+        out->board[2][0], out->board[2][1], out->board[2][2], out->board[2][3],
+        out->board[2][4], out->board[2][5], out->board[2][6], out->board[2][7],
+        out->board[3][0], out->board[3][1], out->board[3][2], out->board[3][3],
+        out->board[3][4], out->board[3][5], out->board[3][6], out->board[3][7],
+        out->board[4][0], out->board[4][1], out->board[4][2], out->board[4][3],
+        out->board[4][4], out->board[4][5], out->board[4][6], out->board[4][7],
+        out->board[5][0], out->board[5][1], out->board[5][2], out->board[5][3],
+        out->board[5][4], out->board[5][5], out->board[5][6], out->board[5][7],
+        out->board[6][0], out->board[6][1], out->board[6][2], out->board[6][3],
+        out->board[6][4], out->board[6][5], out->board[6][6], out->board[6][7],
+        out->board[7][0], out->board[7][1], out->board[7][2], out->board[7][3],
+        out->board[7][4], out->board[7][5], out->board[7][6], out->board[7][7],
         &out->timeout,
         out->scores.username[0], &out->scores.score[0],
         out->scores.username[1], &out->scores.score[1],

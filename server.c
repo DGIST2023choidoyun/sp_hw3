@@ -22,7 +22,6 @@
 #define CLOSE(fd) close(fd);
 #endif
 
-#define DEBUG
 #ifdef DEBUG
 #define LOG(msg)                    printf("%s", msg)
 #else
@@ -97,10 +96,11 @@ int main() {
 
     if (res = setNetwork(&socket)) {
         return res;
-    } 
-    
+    }
+    LOG("hosted\n");
     verifyRegistration(socket, clients);
 
+    while(1);
     // while(1) {
     //     int client = accept(socket, NULL, NULL);
     //     if (client == -1) {
@@ -138,9 +138,7 @@ void verifyRegistration(int sockfd, Client* pclients) {
             continue;
         }
 
-        printf("asda\n");
-
-        Request req = { .type = "", .username = "" };
+        Request req = { .type = "", .username = "", .board = { 0 } };
         RECV_TO(len, client, buffer);
         
         parsing(buffer, &req);
@@ -151,10 +149,11 @@ void verifyRegistration(int sockfd, Client* pclients) {
             continue;
         } else if (SAME_STR(req.type, "register") && !SAME_STR("", req.username)) {
             // register
-            const Request res = { .type = "register_ack" };
+            const Request res = { .type = "register_ack", .board = { 0 } };
 
             if (SEND(client, stringfy(&res)) < 0) {
                 // err
+                LOG("unexpected error\n");
                 CLOSE(client);
                 continue;
             }
@@ -170,12 +169,13 @@ void verifyRegistration(int sockfd, Client* pclients) {
 
         if (indices == 3) {
             // game-start
-            Request req = { .type = "game_start" };
+            Request req = { .type = "game_start", .board = { 0 } };
 
             strcpy(req.players[0], pclients[0].username);
             strcpy(req.players[1], pclients[1].username);
             strcpy(req.first_player, pclients[0].username);
 
+            Sleep(2000);
             int i;
             bool unconnected = FALSE;
             for (i = 0; i < 2; i++) {
@@ -240,7 +240,7 @@ bool setNetwork(int* sockfd) {
 
 char* stringfy(const Request* obj) {
     static char buffer[PAYLOAD_BUFFER];
-    char boardString[274] = "[";
+    char boardString[512] = "[";
     char scoresString[NAME_LEN] = "";
 
     // board
@@ -248,7 +248,10 @@ char* stringfy(const Request* obj) {
     for (i = 0; i < 8; i++) {
         strcat(boardString, "[");
         for (j = 0; j < 8; j++) {
-            sprintf(boardString, "\"%c\"%c", obj->board[i][j], (j < 7 ? "," : ""));
+            char temp[5];
+            char ch = obj->board[i][j];
+            sprintf(temp, "\"%c\"%s", ch == 0 ? '.' : ch, (j < 7 ? "," : ""));
+            strcat(boardString, temp);
         }
         strcat(boardString, "]");
         if (i < 7)
@@ -260,7 +263,7 @@ char* stringfy(const Request* obj) {
     sprintf(scoresString, "{\"%s\":%d,\"%s\":%d}", obj->scores.username[0], obj->scores.score[0], obj->scores.username[1], obj->scores.score[1]);
 
     sprintf(buffer, 
-        "{\"type\":\"%s\",\"username\":\"%s\",\"sx\":%d,\"sy\":%d,\"tx\":%d,\"ty\":%d,\"players\":[\"%s\",\"%s\"],\"first_player\":\"%s\",\"board\":%s,\"timeout\":%.1f,\"scores\":{%s},\"next_player\":\"%s\",\"reason\":\"%s\"}\n", // newline needed
+        "{\"type\":\"%s\",\"username\":\"%s\",\"sx\":%d,\"sy\":%d,\"tx\":%d,\"ty\":%d,\"players\":[\"%s\",\"%s\"],\"first_player\":\"%s\",\"board\":%s,\"timeout\":%.1f,\"scores\":%s,\"next_player\":\"%s\",\"reason\":\"%s\"}\n", // newline needed
         obj->type,
         obj->username,
         obj->sx, obj->sy, obj->tx, obj->ty,
@@ -277,14 +280,16 @@ char* stringfy(const Request* obj) {
 }
 
 void parsing(const char* json, Request* out) {
-    char boardFormat[256] = "[";
-    char format[1024] = "{\"type\":\"%%31[^\"]\",\"username\":\"%%255[^\"]\",\"sx\":%%d,\"sy\":%%d,\"tx\":%%d,\"ty\":%%d,\"players\":[\"%%255[^\"]\",\"%%255[^\"]\"],\"first_player\":\"%%255[^\"]\",\"board\":";
+    char boardFormat[512] = "[";
+    char format[1024] = "{\"type\":\"%31[^\"]\",\"username\":\"%255[^\"]\",\"sx\":%d,\"sy\":%d,\"tx\":%d,\"ty\":%d,\"players\":[\"%255[^\"]\",\"%255[^\"]\"],\"first_player\":\"%255[^\"]\",\"board\":";
 
     int i, j;
-    for (i = 0; i < 8; i++) {
+    for (int i = 0; i < 8; i++) {
         strcat(boardFormat, "[");
-        for (j = 0; j < 8; j++) {
-            sprintf(boardFormat, "\"%%1[^\"]\"%c", (j < 7 ? "," : ""));
+        for (int j = 0; j < 8; j++) {
+            char temp[10];
+            sprintf(temp, "\"%%c\"%s", (j < 7 ? "," : ""));
+            strcat(boardFormat, temp);
         }
         strcat(boardFormat, "]");
         if (i < 7)
@@ -293,7 +298,9 @@ void parsing(const char* json, Request* out) {
     strcat(boardFormat, "]");
 
     strcat(format, boardFormat);
-    strcat(format, ",\"timeout\":%%f,\"scores\":{\"%%255[^\"]\":%%d,\"%%255[^\"]\":%%d},\"next_player\":\"%%255[^\"]\",\"reason\":\"%%31[^\"]\"}");
+    strcat(format, ",\"timeout\":%f,\"scores\":{\"%255[^\"]\":%d,\"%255[^\"]\":%d},\"next_player\":\"%255[^\"]\",\"reason\":\"%31[^\"]\"}");
+
+    printf("form:%s\n", format);
 
     sscanf(json, format,
         out->type,
