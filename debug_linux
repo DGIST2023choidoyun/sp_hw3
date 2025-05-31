@@ -1,0 +1,2 @@
+gcc client.c -o client -ljansson -DDEBUG
+gcc server.c -o server -ljansson -DDEBUG

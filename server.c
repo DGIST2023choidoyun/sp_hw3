@@ -1,33 +1,77 @@
 #include <stdio.h>
 #include <sys/types.h>
-#ifdef _WIN32
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
-    #include <windows.h>
-    #pragma comment(lib, "ws2_32.lib")
-#else
-    #include <sys/socket.h>
-    #include <netdb.h>
-    #include <unistd.h>
-#endif
+#include <string.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <jansson.h>
 
-#define USING_RESPONSE_BUFFER(x)    char x[PAYLOAD_BUFFER]
-#define RECV(x, y)                  recv(x, y, sizeof(y) - 1, 0)
-#define RECV_TO(to, x, y)           int to = recv(x, y, sizeof(y) - 1, 0);y[to] = '\0'
-#define SEND(x, y)                  send(x, y, strlen(y), 0)
-#define SAME_STR(x, y)              !strcmp((x), (y))
-#ifdef _WIN32
-#define CLOSE(fd) closesocket(fd);
-#else
-#define CLOSE(fd) close(fd);
-#endif
+#pragma region MACRO_TCP
+#define USING_RESPONSE_BUFFER(x)            char x[PAYLOAD_BUFFER]
+#define RECV(x, y)                          recv(x, y, sizeof(y) - 1, 0)
+#define RECV_TO(to, x, y)                   int to = RECV(x, y);y[to] = '\0'
+#define SEND(x, y)                          send(x, y, strlen(y), 0)
+#define SEND_TO(to, x, y)                   int to = SEND(x, y)
+#pragma endregion
+
+#pragma region MACRO_JSON
+#define GET_STR(json, field)                json_string_value(json_object_get(json, field))
+#define GET_INT(json, field)                json_integer_value(json_object_get(json, field))
+#define GET_REAL(json, field)               json_real_value(json_object_get(json, field))
+#define GET_ARR(json, field)                GET_OBJ(json, field)
+#define GET_OBJ(json, field)                json_object_get(json, field)
+#define GET_IDX(json, index)                json_array_get(json, index)
+
+#define SET_STR(json, field, value)         json_object_set_new(json, field, json_string(value))
+#define SET_INT(json, field, value)         json_object_set_new(json, field, json_integer(value))
+#define SET_REAL(json, field, value)        json_object_set_new(json, field, json_real(value))
+#define SET_ARR(json, field, value)         SET_OBJ(json, field, value)
+#define SET_OBJ(json, field, value)         json_object_set_new(json, field, value)
+#define SET_IDX_STR(json, index, value)     json_array_set_new(json, index, json_string(value))
+#define SET_IDX_INT(json, index, value)     json_array_set_new(json, index, json_integer(value))
+#define SET_IDX_REAL(json, index, value)    json_array_set_new(json, index, json_real(value))
+#define SET_IDX_ARR(json, index, value)     SET_IDX_OBJ(json, index, value)
+#define SET_IDX_OBJ(json, index, value)     json_array_set_new(json, index, value)
+#define ADD_STR(json, value)                json_array_append_new(json, json_string(value))
+#define ADD_INT(json, value)                json_array_append_new(json, json_integer(value))
+#define ADD_REAL(json, value)               json_array_append_new(json, json_real(value))
+#define ADD_ARR(json, value)                ADD_OBJ(json, value)
+#define ADD_OBJ(json, value)                json_array_append_new(json, value)
+
+#define TO_STR(value)                       json_string_value(value)
+#define TO_INT(value)                       json_integer_value(value)
+#define TO_REAL(value)                      json_real_value(value)
+
+#define IS_STR(json)                        json_is_string(json)
+#define IS_INT(json)                        json_is_integer(json)
+#define IS_REAL(json)                       json_is_real(json)
+#define IS_ARR(json)                        json_is_array(json)
+#define IS_OBJ(json)                        json_is_object(json)
+
+#define IS_STR_F(json, field)               IS_OBJ(json) && IS_STR(GET_OBJ(json, field))
+#define IS_INT_F(json, field)               IS_OBJ(json) && IS_INT(GET_OBJ(json, field))
+#define IS_REAL_F(json, field)              IS_OBJ(json) && IS_REAL(GET_OBJ(json, field))
+#define IS_OBJ_F(json, field)               IS_OBJ(json) && IS_OBJ(GET_OBJ(json, field))
+#define IS_ARR_F(json, field)               IS_OBJ(json) && IS_ARR(GET_OBJ(json, field))
+#define IS_VALID_ARR(json, index)           IS_ARR(json) && index < json_array_size(json)
+#define LEN_ARR(json)                       json_array_size(json)
+
+#define STRINGFY(json)                      json_dumps(json, JSON_COMPACT)
+
+#define FREE_AFTER_STRINGFY(json)           json_decref(json)
+#define FREE_AFTER_GET(json)                json_decref(json)
+#define FREE_STR_AFTER_SEND(pstr)           free(pstr)
+#pragma endregion
 
 #ifdef DEBUG
-#define LOG(msg)                    printf("%s", msg)
+#define LOG(msg)                            printf("%s", msg)
 #else
 #define LOG(mas)
 #endif
 
+#pragma region CONSTS
+#define TRUE                        1
+#define FALSE                       0
 #define SUCCESS                     0
 #define WHAT_ERR                    2
 #define SOCK_ERR                    3
@@ -38,56 +82,31 @@
 
 #define NAME_LEN                    256
 #define PAYLOAD_BUFFER              2048
+#pragma endregion
+
+#pragma region MACRO_UTIL
+#define SAME_STR(x, y)                      !strcmp((x), (y))
 
 #define INITIAL_BOARD               "R......B................................................B......R"
+#pragma endregion
 
 typedef struct addrinfo sAddrinfo;
 typedef char bool;
-
-
-typedef struct {
-    char username[2][NAME_LEN];
-    int score[2];
-} Scores;
-
-typedef struct {
-    //common
-    char type[32];
-
-    //reqs
-    char username[NAME_LEN];
-    int sx, sy, tx, ty;
-    char players[2][NAME_LEN];
-    char first_player[NAME_LEN];
-    char board[8][8];
-    float timeout;
-    Scores scores;
-
-    //resps
-    char reason[32];
-    char next_player[NAME_LEN];
-
-} Request;
 
 typedef struct {
     char username[NAME_LEN];
     int clientfd;
 } Client;
 
-char* stringfy(const Request* obj);
-void parsing(const char* json, Request* out);
+void frees(int num, ...);
+
+bool parse(json_t** json, const char* input);
+char* stringfy(json_t** json);
 
 bool setNetwork(int* sockfd);
 void verifyRegistration(int sockfd, Client* pclients);
 
 int main() {
-    #ifdef _WIN32
-        WSADATA wsa;
-        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-            return WIN_ERR;
-        }
-    #endif
-
     int socket;
     bool res;
     USING_RESPONSE_BUFFER(buffer);
@@ -133,55 +152,104 @@ void verifyRegistration(int sockfd, Client* pclients) {
     char indices = 0; // index mask
 
     while (TRUE) {
+        LOG("waiting...\n");
         int client = accept(sockfd, NULL, NULL);
         if (client == -1) {
             continue;
         }
 
-        Request req = { .type = "", .username = "", .board = { 0 } };
+        json_t* req;
+        char *type, *username;
         RECV_TO(len, client, buffer);
         
-        parsing(buffer, &req);
-
-        if (indices == 1 && SAME_STR(req.username, pclients[0].username) || indices == 2 && SAME_STR(req.username, pclients[1].username)) {
-            CLOSE(client);
-            LOG("existing username\n");
+        if(!parse(&req, buffer)) {
+            // req == NULL
+            close(client);
             continue;
-        } else if (SAME_STR(req.type, "register") && !SAME_STR("", req.username)) {
-            // register
-            const Request res = { .type = "register_ack", .board = { 0 } };
+        }
 
-            if (SEND(client, stringfy(&res)) < 0) {
+        if (IS_STR_F(req, "type") && IS_STR_F(req, "username")) {
+            const char* fType = GET_STR(req, "type");
+            const char* fUsername = GET_STR(req, "username");
+            type = strdup(fType);
+            username = strdup(fUsername);
+        } else goto INVALID_FREE;
+        
+
+        if (username == NULL || type == NULL) {
+            LOG("empty\n");
+            goto INVALID_FREE;
+        } else if (indices == 1 && SAME_STR(username, pclients[0].username) || indices == 2 && SAME_STR(username, pclients[1].username)) {
+            LOG("existing username\n");
+            json_t* req = json_object();
+            SET_STR(req, "type", "register_nack");
+            SET_STR(req, "reason", "invalid");
+
+            char* resString = stringfy(&req);
+
+            FREE_AFTER_STRINGFY(req);
+
+            SEND_TO(res, client, resString);
+            FREE_STR_AFTER_SEND(resString);
+
+            goto INVALID_FREE;
+        } else if (SAME_STR(type, "register") && !SAME_STR("", username)) {
+            // register
+            json_t* req = json_object();
+            SET_STR(req, "type", "register_ack");
+            
+            char* resString = stringfy(&req);
+
+            FREE_AFTER_STRINGFY(req);
+
+            #ifdef DEBUG
+                sleep(2);
+            #endif
+
+            SEND_TO(res, client, resString);
+            FREE_STR_AFTER_SEND(resString);
+            if (res <= 0) {
                 // err
                 LOG("unexpected error\n");
-                CLOSE(client);
-                continue;
+                goto INVALID_FREE;
             }
 
             LOG("user registered\n");
 
             int newIdx = indices % 2 == 0 ? 0 : 1;
             pclients[newIdx].clientfd = client;
-            strcpy(pclients[newIdx].username, req.username);
+            strcpy(pclients[newIdx].username, username);
 
             indices += 1 << newIdx;
         }
 
         if (indices == 3) {
             // game-start
-            Request req = { .type = "game_start", .board = { 0 } };
+            json_t* res = json_object();
+            json_t* players = json_array();
+            ADD_STR(players, pclients[0].username);
+            ADD_STR(players, pclients[1].username);
+            SET_STR(res, "type", "game_start");
+            SET_STR(res, "first_player", pclients[0].username);
+            SET_ARR(res, "players", players);
 
-            strcpy(req.players[0], pclients[0].username);
-            strcpy(req.players[1], pclients[1].username);
-            strcpy(req.first_player, pclients[0].username);
+            char* resString = stringfy(&res);
 
-            Sleep(2000);
+            printf("res: %s \n", resString);
+
+            FREE_AFTER_STRINGFY(players);
+            FREE_AFTER_STRINGFY(res);
+
+            #ifdef DEBUG
+                sleep(2);
+            #endif
+
             int i;
             bool unconnected = FALSE;
             for (i = 0; i < 2; i++) {
-                if (SEND(pclients[i].clientfd, stringfy(&req)) < 0) {
+                if (SEND(pclients[i].clientfd, resString) <= 0) {
                     // reset when unconnected
-                    CLOSE(pclients[i].clientfd);
+                    close(pclients[i].clientfd);
 
                     pclients[i].clientfd = -1;
                     strcpy(pclients[i].username, "");
@@ -192,10 +260,25 @@ void verifyRegistration(int sockfd, Client* pclients) {
                     LOG("unconnected\n");
                 }
             }
-            if (unconnected) continue;
+
+            FREE_STR_AFTER_SEND(resString);
+
+            if (unconnected) goto VALID_FREE;
             LOG("game start\n");
+            frees(2, username, type);
+            FREE_AFTER_GET(req);
             break; // succeed
         }
+
+        
+        VALID_FREE:
+            frees(2, username, type);
+            FREE_AFTER_GET(req);
+        continue;
+        INVALID_FREE:
+            frees(2, username, type);
+            FREE_AFTER_GET(req);
+            close(client);
     }
 }
 
@@ -219,11 +302,7 @@ bool setNetwork(int* sockfd) {
     }
 
     int reuse = 1;
-    #ifdef _WIN32
-        setsockopt(*sockfd, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
-    #else
-        setsockopt(*sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    #endif
+    setsockopt(*sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
     status = bind(*sockfd, res->ai_addr, res->ai_addrlen);
     if (status == -1) {
@@ -238,95 +317,49 @@ bool setNetwork(int* sockfd) {
     return SUCCESS;
 }
 
-char* stringfy(const Request* obj) {
-    static char buffer[PAYLOAD_BUFFER];
-    char boardString[512] = "[";
-    char scoresString[NAME_LEN] = "";
+bool parse(json_t** json, const char* input) {
+    json_error_t error;
+    *json = json_loads(input, 0, &error);
 
-    // board
-    int i, j;
-    for (i = 0; i < 8; i++) {
-        strcat(boardString, "[");
-        for (j = 0; j < 8; j++) {
-            char temp[5];
-            char ch = obj->board[i][j];
-            sprintf(temp, "\"%c\"%s", ch == 0 ? '.' : ch, (j < 7 ? "," : ""));
-            strcat(boardString, temp);
-        }
-        strcat(boardString, "]");
-        if (i < 7)
-            strcat(boardString, ",");
+    if (!*json) {
+        printf("Parse error: %s (line %d)\n", error.text, error.line);
+        return FALSE;
     }
-    strcat(boardString, "]");
 
-    // scores
-    sprintf(scoresString, "{\"%s\":%d,\"%s\":%d}", obj->scores.username[0], obj->scores.score[0], obj->scores.username[1], obj->scores.score[1]);
+    return TRUE;
+}
+char* stringfy(json_t** json) {
+    char* str = STRINGFY(*json);
+    size_t len = strlen(str);
+    char* newline = malloc(len + 2);
 
-    sprintf(buffer, 
-        "{\"type\":\"%s\",\"username\":\"%s\",\"sx\":%d,\"sy\":%d,\"tx\":%d,\"ty\":%d,\"players\":[\"%s\",\"%s\"],\"first_player\":\"%s\",\"board\":%s,\"timeout\":%.1f,\"scores\":%s,\"next_player\":\"%s\",\"reason\":\"%s\"}\n", // newline needed
-        obj->type,
-        obj->username,
-        obj->sx, obj->sy, obj->tx, obj->ty,
-        obj->players[0], obj->players[1],
-        obj->first_player,
-        boardString,
-        obj->timeout,
-        scoresString,
-        obj->next_player,
-        obj->reason
-    );
+    if (!newline) {
+        free(str);
+        return NULL;
+    }
 
-    return buffer;
+    memcpy(newline, str, len);
+    newline[len] = '\n';
+    newline[len + 1] = '\0';
+
+    free(str);
+
+    return newline;
 }
 
-void parsing(const char* json, Request* out) {
-    char boardFormat[512] = "[";
-    char format[1024] = "{\"type\":\"%31[^\"]\",\"username\":\"%255[^\"]\",\"sx\":%d,\"sy\":%d,\"tx\":%d,\"ty\":%d,\"players\":[\"%255[^\"]\",\"%255[^\"]\"],\"first_player\":\"%255[^\"]\",\"board\":";
+void frees(int num, ...)
+{
+    va_list ap;
+    int i;
 
-    int i, j;
-    for (int i = 0; i < 8; i++) {
-        strcat(boardFormat, "[");
-        for (int j = 0; j < 8; j++) {
-            char temp[10];
-            sprintf(temp, "\"%%c\"%s", (j < 7 ? "," : ""));
-            strcat(boardFormat, temp);
+    va_start(ap, num);
+    
+    for (i = 0; i < num; i++) {
+        void* ptr = va_arg(ap, void *);
+
+        if (ptr != NULL) {
+            free(ptr);
         }
-        strcat(boardFormat, "]");
-        if (i < 7)
-            strcat(boardFormat, ",");
     }
-    strcat(boardFormat, "]");
-
-    strcat(format, boardFormat);
-    strcat(format, ",\"timeout\":%f,\"scores\":{\"%255[^\"]\":%d,\"%255[^\"]\":%d},\"next_player\":\"%255[^\"]\",\"reason\":\"%31[^\"]\"}");
-
-    printf("form:%s\n", format);
-
-    sscanf(json, format,
-        out->type,
-        out->username,
-        &out->sx, &out->sy, &out->tx, &out->ty,
-        out->players[0], out->players[1],
-        out->first_player,
-        out->board[0][0], out->board[0][1], out->board[0][2], out->board[0][3],
-        out->board[0][4], out->board[0][5], out->board[0][6], out->board[0][7],
-        out->board[1][0], out->board[1][1], out->board[1][2], out->board[1][3],
-        out->board[1][4], out->board[1][5], out->board[1][6], out->board[1][7],
-        out->board[2][0], out->board[2][1], out->board[2][2], out->board[2][3],
-        out->board[2][4], out->board[2][5], out->board[2][6], out->board[2][7],
-        out->board[3][0], out->board[3][1], out->board[3][2], out->board[3][3],
-        out->board[3][4], out->board[3][5], out->board[3][6], out->board[3][7],
-        out->board[4][0], out->board[4][1], out->board[4][2], out->board[4][3],
-        out->board[4][4], out->board[4][5], out->board[4][6], out->board[4][7],
-        out->board[5][0], out->board[5][1], out->board[5][2], out->board[5][3],
-        out->board[5][4], out->board[5][5], out->board[5][6], out->board[5][7],
-        out->board[6][0], out->board[6][1], out->board[6][2], out->board[6][3],
-        out->board[6][4], out->board[6][5], out->board[6][6], out->board[6][7],
-        out->board[7][0], out->board[7][1], out->board[7][2], out->board[7][3],
-        out->board[7][4], out->board[7][5], out->board[7][6], out->board[7][7],
-        &out->timeout,
-        out->scores.username[0], &out->scores.score[0],
-        out->scores.username[1], &out->scores.score[1],
-        out->next_player, out->reason
-    );
+    va_end(ap);
 }
