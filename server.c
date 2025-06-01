@@ -2,6 +2,7 @@
 #include <sys/types.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <poll.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <jansson.h>
@@ -47,6 +48,7 @@
 #define IS_REAL(json)                       json_is_real(json)
 #define IS_ARR(json)                        json_is_array(json)
 #define IS_OBJ(json)                        json_is_object(json)
+#define IS_NULL(json)                       json_is_null(json)
 
 #define IS_STR_F(json, field)               IS_OBJ(json) && IS_STR(GET_OBJ(json, field))
 #define IS_INT_F(json, field)               IS_OBJ(json) && IS_INT(GET_OBJ(json, field))
@@ -73,213 +75,282 @@
 #define TRUE                        1
 #define FALSE                       0
 #define SUCCESS                     0
-#define WHAT_ERR                    2
+#define ADDR_ERR                    2
 #define SOCK_ERR                    3
 #define BIND_ERR                    4
 #define LSTN_ERR                    5
 #define ACPT_ERR                    6
 #define WIN_ERR                     100
+#define POLL_ERR                    7
 
 #define NAME_LEN                    256
 #define PAYLOAD_BUFFER              2048
 #pragma endregion
 
 #pragma region MACRO_UTIL
-#define SAME_STR(x, y)                      !strcmp((x), (y))
+#define SAME_STR(x, y)              !strcmp((x), (y))
 
-#define INITIAL_BOARD               "R......B................................................B......R"
+#define INITIAL_BOARD               "R......B\n........\n........\n........\n........\n........\n........\nB......R\n"
 #pragma endregion
 
+#pragma region  TYPEDEF
 typedef struct addrinfo sAddrinfo;
 typedef char bool;
+typedef char TILE;
 
+typedef enum { CONNECTED, UNCONNECTED } STATUS;
 typedef struct {
     char username[NAME_LEN];
-    int clientfd;
+    int* pfd;
+    STATUS status;
 } Client;
 
+typedef struct pollfd sPollFD;
+#pragma endregion
+
+#pragma region FUNC_DECL
 void frees(int num, ...);
 
 bool parse(json_t** json, const char* input);
 char* stringfy(json_t** json);
+int sendJson_Consume(const int dst, json_t* data);
+int sendStr(const int dst, char* data);
+json_t* recvPayload(const int src);
 
 bool setNetwork(int* sockfd);
-void verifyRegistration(int sockfd, Client* pclients);
+void disconnect(int* sockfd, STATUS* status);
+bool registerPlayer(const int sockfd, json_t* req, int client, Client* pclients);
+#pragma endregion
+void gameStart(Client* pclients);
 
 int main() {
     int socket;
     bool res;
-    USING_RESPONSE_BUFFER(buffer);
-    Client clients[2] = { {.clientfd = -1}, {.clientfd = -1} }; // init as invalid fd
-
+    Client clients[2] = { { .username = { 0 }, .status = UNCONNECTED }, { .username = { 0 }, .status = UNCONNECTED } };
+    sPollFD listener[3];
+    char errCode = SUCCESS;
+    TILE board[8][8];
 
     if (res = setNetwork(&socket)) {
         return res;
     }
+
+    listener[0].fd = socket;
+    listener[0].events = POLLIN;
+    listener[1].fd = -1;
+    listener[1].events = POLLIN;
+    listener[2].fd = -1;
+    listener[2].events = POLLIN;
+
+    // fd binding
+    clients[0].pfd = &listener[1].fd;
+    clients[1].pfd = &listener[2].fd;
     LOG("hosted\n");
-    verifyRegistration(socket, clients);
 
-    while(1);
-    // while(1) {
-    //     int client = accept(socket, NULL, NULL);
-    //     if (client == -1) {
-    //         continue;
-    //     }
+    bool gameProc = FALSE;
 
-    //     int bytes_received = recv(client, buffer, sizeof(buffer) - 1, 0);
-    //     buffer[bytes_received] = '\0';
-    //     printf("Received message: %s", buffer);
-
-    //     const char *response = "Hello, client!\n";
-    //     send(client, response, strlen(response), 0);
-    //     printf("Sent response to client\n");
-
-    //     #ifdef _WIN32
-    //         closesocket(client);
-    //     #else
-    //         close(client);
-    //     #endif
-    //     printf("Closed connection to client\n");
-    // }
-
-    
-    return 0;
-}
-
-void verifyRegistration(int sockfd, Client* pclients) {
-    USING_RESPONSE_BUFFER(buffer);
-
-    char indices = 0; // index mask
-
-    while (TRUE) {
-        LOG("waiting...\n");
-        int client = accept(sockfd, NULL, NULL);
-        if (client == -1) {
-            continue;
+    while(1) {
+        int ready = poll(listener, 3, 0); // non blocking
+        if (ready == -1) {
+            errCode = POLL_ERR;
+            break;
         }
 
-        json_t* req;
-        char *type, *username;
-        RECV_TO(len, client, buffer);
-        
-        if(!parse(&req, buffer)) {
-            // req == NULL
-            close(client);
-            continue;
-        }
+        if (listener[0].revents & POLLIN) { //server
+            int client = accept(socket, NULL, NULL);
+            if (client == -1) {
+                errCode = ACPT_ERR;
+                break;
+            }
 
-        if (IS_STR_F(req, "type") && IS_STR_F(req, "username")) {
-            const char* fType = GET_STR(req, "type");
-            const char* fUsername = GET_STR(req, "username");
-            type = strdup(fType);
-            username = strdup(fUsername);
-        } else goto INVALID_FREE;
-        
+            int i;
+            for (i = 0; i < 2; i++) {
+                if (listener[i + 1].fd == -1) {
+                    listener[i + 1].fd = client;
+                    LOG("accept\n");
+                    break;
+                }
+            }
+            if (i < 2) continue;
 
-        if (username == NULL || type == NULL) {
-            LOG("empty\n");
-            goto INVALID_FREE;
-        } else if (indices == 1 && SAME_STR(username, pclients[0].username) || indices == 2 && SAME_STR(username, pclients[1].username)) {
-            LOG("existing username\n");
+            LOG("reject\n");
+
+            // reject with full user
             json_t* req = json_object();
             SET_STR(req, "type", "register_nack");
             SET_STR(req, "reason", "invalid");
 
-            char* resString = stringfy(&req);
+            sendJson_Consume(client, req);
 
-            FREE_AFTER_STRINGFY(req);
-
-            SEND_TO(res, client, resString);
-            FREE_STR_AFTER_SEND(resString);
-
-            goto INVALID_FREE;
-        } else if (SAME_STR(type, "register") && !SAME_STR("", username)) {
-            // register
-            json_t* req = json_object();
-            SET_STR(req, "type", "register_ack");
-            
-            char* resString = stringfy(&req);
-
-            FREE_AFTER_STRINGFY(req);
-
-            #ifdef DEBUG
-                sleep(2);
-            #endif
-
-            SEND_TO(res, client, resString);
-            FREE_STR_AFTER_SEND(resString);
-            if (res <= 0) {
-                // err
-                LOG("unexpected error\n");
-                goto INVALID_FREE;
-            }
-
-            LOG("user registered\n");
-
-            int newIdx = indices % 2 == 0 ? 0 : 1;
-            pclients[newIdx].clientfd = client;
-            strcpy(pclients[newIdx].username, username);
-
-            indices += 1 << newIdx;
-        }
-
-        if (indices == 3) {
-            // game-start
-            json_t* res = json_object();
-            json_t* players = json_array();
-            ADD_STR(players, pclients[0].username);
-            ADD_STR(players, pclients[1].username);
-            SET_STR(res, "type", "game_start");
-            SET_STR(res, "first_player", pclients[0].username);
-            SET_ARR(res, "players", players);
-
-            char* resString = stringfy(&res);
-
-            printf("res: %s \n", resString);
-
-            FREE_AFTER_STRINGFY(players);
-            FREE_AFTER_STRINGFY(res);
-
-            #ifdef DEBUG
-                sleep(2);
-            #endif
-
-            int i;
-            bool unconnected = FALSE;
-            for (i = 0; i < 2; i++) {
-                if (SEND(pclients[i].clientfd, resString) <= 0) {
-                    // reset when unconnected
-                    close(pclients[i].clientfd);
-
-                    pclients[i].clientfd = -1;
-                    strcpy(pclients[i].username, "");
-
-                    unconnected = TRUE;
-                    indices -= 1 << i;
-
-                    LOG("unconnected\n");
-                }
-            }
-
-            FREE_STR_AFTER_SEND(resString);
-
-            if (unconnected) goto VALID_FREE;
-            LOG("game start\n");
-            frees(2, username, type);
-            FREE_AFTER_GET(req);
-            break; // succeed
-        }
-
-        
-        VALID_FREE:
-            frees(2, username, type);
-            FREE_AFTER_GET(req);
-        continue;
-        INVALID_FREE:
-            frees(2, username, type);
-            FREE_AFTER_GET(req);
             close(client);
+        } 
+        
+        // clients
+        int i, neterr = 0;
+        for (i = 0; i < 2; i++) {
+            int client = *clients[i].pfd;
+            if (client == -1) continue;
+            else if (listener[i + 1].revents & POLLIN) {
+                LOG("client listen\n");
+
+                json_t* req = recvPayload(client);
+                char* type = NULL;
+                if (IS_NULL(req)) {
+                    LOG("network err\n");
+                    neterr++;
+                    goto INVALID_FREE;
+                } else if (IS_STR_F(req, "type")) {
+                    const char* fType = GET_STR(req, "type");
+                    type = strdup(fType);
+                    if (type == NULL) {
+                        LOG("empty\n");
+                        goto INVALID_FREE;
+                    }
+                } else goto INVALID_FREE;
+                
+                // type branching
+                if (SAME_STR(type, "register")) {
+                    if (!registerPlayer(socket, req, client, clients)) {
+                        goto INVALID_FREE;
+                    }
+                } else if (SAME_STR(type, "move")) {
+
+                }
+
+                frees(1, type);
+                FREE_AFTER_GET(req);
+                continue;
+                INVALID_FREE:
+                    frees(1, type);
+                    FREE_AFTER_GET(req);
+                    disconnect(&listener[i + 1].fd, &clients[i].status);
+            }
+        }
+        if (neterr >= 2) {
+            break;
+        }
+
+        if (clients[0].status == CONNECTED && clients[1].status == CONNECTED && !gameProc) {
+            gameStart(clients);
+            LOG("game start\n");
+            gameProc = TRUE;
+
+            // init board state
+            int i;
+            char* pIBoard = INITIAL_BOARD;
+            for (i = 0; i < 8; i++) {
+                char row[9];
+                sscanf(pIBoard, "%8[^\n]\n", row);
+                memcpy(board[i], row, 8);
+                pIBoard += 9;
+            }
+        }
     }
+
+    // game_over?
+    
+    close(socket);
+    int i;
+    for (i = 0; i < 2; i++) {
+        int client = listener[i + 1].fd;
+        if (client != -1) {
+            close(client);
+        }
+    }
+    return errCode;
+}
+
+bool registerPlayer(const int sockfd, json_t* req, int client, Client* pclients) {
+    // req will be freed outside. pclients will be disconnected outside.
+
+    char* username = NULL;
+    int i;
+
+    if (IS_STR_F(req, "username")) {
+        const char* fUsername = GET_STR(req, "username");
+        username = strdup(fUsername);
+        if (username == NULL) {
+            LOG("empty\n");
+            return FALSE;
+        }
+    } else goto ERR;
+
+
+    bool overlap = FALSE;
+    int filled = 0;
+    for (i = 0; i < 2; i++) {
+        if (*(pclients[i].pfd) != -1 && pclients[i].status == CONNECTED) {
+            filled++;
+            if (SAME_STR(username, pclients[i].username)) {
+                overlap = TRUE;
+                break;
+            }
+        }
+    }
+
+    if (overlap || (!SAME_STR(pclients[0].username, "") && !SAME_STR(pclients[1].username, "") && !SAME_STR(pclients[0].username, username) && !SAME_STR(pclients[1].username, username))) {
+        LOG("existing username or not in waiting list\n");
+        json_t* req = json_object();
+        SET_STR(req, "type", "register_nack");
+        SET_STR(req, "reason", "invalid");
+
+        sendJson_Consume(client, req);
+
+        goto ERR;
+    } else {
+        // register
+        json_t* req = json_object();
+        SET_STR(req, "type", "register_ack");
+
+        #ifdef DEBUG
+            sleep(2);
+        #endif
+
+        int res = sendJson_Consume(client, req);
+        
+        if (res <= 0) {
+            // err
+            LOG("unexpected error\n");
+            goto ERR;
+        }
+
+        LOG("user registered\n");
+
+        pclients[filled].status = CONNECTED;
+        strcpy(pclients[filled].username, username);
+    }
+
+    return TRUE;
+    ERR:
+        frees(1, username);
+        return FALSE;
+}
+void gameStart(Client* pclients) {
+    // game-start
+    json_t* res = json_object();
+    json_t* players = json_array();
+    ADD_STR(players, pclients[0].username);
+    ADD_STR(players, pclients[1].username);
+    SET_STR(res, "type", "game_start");
+    SET_STR(res, "first_player", pclients[0].username);
+    SET_ARR(res, "players", players);
+
+    char* resString = stringfy(&res);
+
+    FREE_AFTER_STRINGFY(players);
+    FREE_AFTER_STRINGFY(res);
+
+    #ifdef DEBUG
+        sleep(2);
+    #endif
+
+    int i;
+    for (i = 0; i < 2; i++) {
+        int client = *(pclients[i].pfd);
+        sendStr(client, resString);
+    }
+
+    FREE_STR_AFTER_SEND(resString);
 }
 
 bool setNetwork(int* sockfd) {
@@ -293,7 +364,7 @@ bool setNetwork(int* sockfd) {
 
     status = getaddrinfo(NULL, "5000", &hints, &res);
     if (status != 0) {
-        return WHAT_ERR;
+        return ADDR_ERR;
     }
 
     *sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
@@ -309,14 +380,22 @@ bool setNetwork(int* sockfd) {
         return BIND_ERR;
     }
 
-    status = listen(*sockfd, 1);
+    status = listen(*sockfd, 2); // back log queue = 2 => dealing with sudden connection request for 2 users.
     if (status == -1) {
         return LSTN_ERR;
     }
 
     return SUCCESS;
 }
+void disconnect(int* sockfd, STATUS* status) {
+    if (*sockfd != -1) {
+        *status = UNCONNECTED;
+        close(*sockfd);
+        *sockfd = -1;
+    }
+}
 
+#pragma region FUNC_JSON
 bool parse(json_t** json, const char* input) {
     json_error_t error;
     *json = json_loads(input, 0, &error);
@@ -330,8 +409,11 @@ bool parse(json_t** json, const char* input) {
 }
 char* stringfy(json_t** json) {
     char* str = STRINGFY(*json);
+    if (!str) {
+        return NULL;
+    }
     size_t len = strlen(str);
-    char* newline = malloc(len + 2);
+    char* newline = (char*)malloc(len + 2);
 
     if (!newline) {
         free(str);
@@ -347,6 +429,110 @@ char* stringfy(json_t** json) {
     return newline;
 }
 
+int sendJson_Consume(const int dst, json_t* data) {
+    char* payload = stringfy(&data);
+    FREE_AFTER_STRINGFY(data);
+
+    if (!payload) {
+        return -1; //err
+    }
+
+    ssize_t sent = sendStr(dst, payload);
+
+    if (sent <= 0) {
+        FREE_STR_AFTER_SEND(payload);
+        return -1;
+    }
+
+    FREE_STR_AFTER_SEND(payload);
+
+    return sent;
+}
+int sendStr(const int dst, char* data) {
+    ssize_t total = strlen(data); 
+    ssize_t remain = total;
+    ssize_t sent = 0;
+
+    while (remain > 0) {
+        ssize_t n = send(dst, data + sent, remain, 0);
+        if (n <= 0) { // err
+            return -1;
+        }
+        sent += n;
+        remain -= n;
+    }
+
+    return sent;
+}
+json_t* recvPayload(const int src) {
+    static USING_RESPONSE_BUFFER(buffer);
+    static ssize_t len = 0;
+
+    char *pnl, *bnl;
+    char* payload = NULL;
+
+    do {
+        if (len == PAYLOAD_BUFFER - 1) len = 0; // excessive payload
+        len += recv(src, buffer + len, sizeof(buffer) - len - 1, 0);
+        if (len <= 0) goto ERR_RET;
+        buffer[len] = '\0'; // for separated stream's end
+        
+        // inefficient but not bad at most case
+        ssize_t newLen = len + 1;
+        char* payloadBuffer = NULL;
+
+        if (payload) {
+            size_t payloadLen = strlen(payload);
+            payloadBuffer = (char*)malloc(payloadLen + 1);
+            if (!payloadBuffer) { // memory issue
+                goto ERR_RET;
+            }
+            strcpy(payloadBuffer, payload); // save prev payload
+
+            newLen += (ssize_t)payloadLen;
+            free(payload);
+            payload = NULL;
+        }
+
+        payload = (char*)malloc(newLen);
+        payload[0] = '\0';
+        if (!payload) { // memory issue;
+            goto ERR_RET;
+        }
+        if (payloadBuffer) {
+            strcpy(payload, payloadBuffer);
+            free(payloadBuffer);
+        };
+        strcat(payload, buffer);
+
+    } while (!(pnl = strchr(payload, '\n')));
+    // payload: (short~long payload stream)\n(short payload stream or not)
+
+    *pnl = '\0';
+    bnl = strchr(buffer, '\n'); // have to contain \n since while is broken on new payload has \n.
+    *bnl = '\0';
+
+    json_t* json;
+    if (!parse(&json, payload)) goto ERR_RET;
+
+    free(payload);
+
+    ssize_t processed = bnl - buffer + 1;
+    memmove(buffer, buffer + processed, len - processed);
+    len -= processed;
+    buffer[len] = '\0';
+
+    return json;
+    ERR_RET:
+        if (payload) {
+            free(payload);
+        }
+        return json_null();
+}
+#pragma endregion
+
+
+#pragma region FUNC_UTIL
 void frees(int num, ...)
 {
     va_list ap;
@@ -363,3 +549,4 @@ void frees(int num, ...)
     }
     va_end(ap);
 }
+#pragma endregion
