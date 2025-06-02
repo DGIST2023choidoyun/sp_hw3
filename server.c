@@ -10,10 +10,6 @@
 
 #pragma region MACRO_TCP
 #define USING_RESPONSE_BUFFER(x)            char x[PAYLOAD_BUFFER]
-#define RECV(x, y)                          recv(x, y, sizeof(y) - 1, 0)
-#define RECV_TO(to, x, y)                   int to = RECV(x, y);y[to] = '\0'
-#define SEND(x, y)                          send(x, y, strlen(y), 0)
-#define SEND_TO(to, x, y)                   int to = SEND(x, y)
 #pragma endregion
 
 #pragma region MACRO_JSON
@@ -106,7 +102,6 @@ typedef struct {
     char username[NAME_LEN];
     int* pfd;
     STATUS status;
-    int score;
     clock_t timer;
 } Client;
 
@@ -115,6 +110,10 @@ typedef struct pollfd sPollFD;
 
 #pragma region FUNC_DECL
 void frees(int num, ...);
+void initBoard(TILE board[8][8]);
+void printBoard(const TILE pboard[8][8]);
+bool isFullBoard(const TILE board[8][8]);
+void getUnitCnt(const TILE board[8][8], int* pred, int* pblue);
 
 bool parse(json_t** json, const char* input);
 char* stringfy(json_t** json);
@@ -125,10 +124,11 @@ json_t* recvPayload(const int src);
 
 bool setNetwork(int* sockfd);
 void disconnect(int* sockfd, STATUS* status);
-bool registerPlayer(const int sockfd, json_t* req, int client, Client* pclients, const bool gameProc);
+bool registerPlayer(json_t* req, int client, Client* pclients, const bool gameProc);
+void reject(const int client);
 bool gameStart(Client* pclients, bool* gameProc);
 void nextTurn(int* curTurn, Client* pclients, const TILE board[8][8]);
-void validation(const int curTurn, Client* pclients, TILE board[8][8], json_t* movereq);
+void validation(const int curTurn, Client* pclients, TILE board[8][8], json_t* movereq, bool* pass);
 json_t* getBoardJson(const TILE board[8][8]);
 void flip(const int x, const int y, const TILE cur, TILE board[8][8]);
 #pragma endregion
@@ -136,11 +136,9 @@ void flip(const int x, const int y, const TILE cur, TILE board[8][8]);
 
 int main() {
     int socket;
-    bool res;
-    Client clients[2] = { { .score = 0, .username = { 0 }, .status = DISCONNECTED }, { .score = 0, .username = { 0 }, .status = DISCONNECTED } };
+    Client clients[2] = { { .username = { 0 }, .status = DISCONNECTED }, { .username = { 0 }, .status = DISCONNECTED } };
     sPollFD listener[3];
-    TILE board[8][8];
-    bool err = FALSE;
+    
 
     if (!setNetwork(&socket)) {
         LOGG("[netset error]\n");
@@ -160,10 +158,18 @@ int main() {
     LOGG("[server hosted]\n");
 
     bool gameProc = FALSE;
+    bool pass = FALSE;
+    TILE board[8][8];
+    bool err = FALSE;
     int turn = -1;
 
     while(1) {
-        int ready = poll(listener, 3, 0); // non blocking
+        if (gameProc && clients[0].status == DISCONNECTED && clients[1].status == DISCONNECTED) {
+            LOGG("[fatal error: both disconnected]\n");
+            break;
+        }
+
+        int ready = poll(listener, 3, 0);
         if (ready == -1) {
             err = TRUE;
             break;
@@ -180,31 +186,24 @@ int main() {
             for (i = 0; i < 2; i++) {
                 if (listener[i + 1].fd == -1) {
                     listener[i + 1].fd = client;
-                    LOG("accept\n");
+                    LOG("accept %d\n", client);
                     break;
                 }
             }
             if (i < 2) continue;
 
-            LOGG("[user rejected: full]\n");
-
-            json_t* req = json_object();
-            SET_STR(req, "type", "register_nack");
-            SET_STR(req, "reason", "invalid");
-
-            sendJson(client, req);
-            consume(1, req);
-
-            close(client);
+            reject(client);
         } 
         
         // clients
-        int i, neterr = 0;
+        int i;
         for (i = 0; i < 2; i++) {
             int client = *clients[i].pfd;
 
-            if (client == -1) continue;
-
+            if (client == -1) {
+                continue;
+            }
+            
             else if (listener[i + 1].revents & POLLIN) {
                 bool invalid = FALSE;
 
@@ -215,8 +214,8 @@ int main() {
                     LOGG("[network error: %s]\n", clients[i].username);
                     if (gameProc && CUR_IDX(turn) == i) { // current user turn
                         nextTurn(&turn, clients, board); // but pass
-                    } // nor disconnect
-                    neterr++;
+                    }
+                    pass = TRUE; // network pass
                     invalid = TRUE;
                 } else if (IS_STR_F(req, "type")) {
                     const char* fType = GET_STR(req, "type");
@@ -228,27 +227,47 @@ int main() {
                     } else {
                         // type branching
                         if (SAME_STR(type, "register")) {
-                            if (!registerPlayer(socket, req, client, clients, gameProc)) {
+                            if (!registerPlayer(req, client, clients, gameProc)) {
                                 invalid = TRUE;
+                            } else if (gameStart(clients, &gameProc)) { // game_start
+                                // clients check game_start after register_ack.
+
+                                if (turn < 0) {
+                                    initBoard(board);
+                                    nextTurn(&turn, clients, board); // turn 1 start
+                                }
+                                
                             }
                         } else if (gameProc && SAME_STR(type, "move")) {
-                            validation(turn, clients, board, req);
-                            nextTurn(&turn, clients, board); // turn must increase unconditionally
+                            bool prevPass = pass;
+                            validation(turn, clients, board, req, &pass);
+                            if (pass && prevPass) {
+                                frees(1, &type);
+                                consume(1, &req);
+                                goto END_GAME;
+                            } else if (gameProc && CUR_IDX(turn) == i) { // current user turn
+                                printBoard(board);
+                                int red, blue;
+                                getUnitCnt(board, &red, &blue);
+                                if (isFullBoard(board) || red == 0 || blue == 0) {
+                                    frees(1, &type);
+                                    consume(1, &req);
+                                    goto END_GAME;
+                                }
+                                nextTurn(&turn, clients, board); // turn must increase unconditionally
+                            }
                         }
                     }
                 } else invalid = TRUE;
 
                 if (invalid)
                     disconnect(&listener[i + 1].fd, &clients[i].status);
-                frees(1, type);
-                consume(1, req);
+                frees(1, &type);
+                consume(1, &req);
             }
         }
 
-        if (neterr >= 2) { // fatal error
-            LOGG("[fatal error: both disconnected]\n");
-            break;
-        } else if (gameProc) {
+        if (gameProc) {
             if ((clock() - clients[CUR_IDX(turn)].timer)  / CLOCKS_PER_SEC > 5) {
                 json_t* req = json_object();
                 SET_STR(req, "type", "pass");
@@ -256,32 +275,29 @@ int main() {
 
                 LOGG("[timeout: %s]\n", clients[CUR_IDX(turn)].username);
                 sendJson(*(clients[CUR_IDX(turn)].pfd), req); // disconnection will be delegated
-                consume(1, req);
+                consume(1, &req);
+
+                pass = TRUE;
                 
                 nextTurn(&turn, clients, board);
             }
-        } else if (gameStart(clients, &gameProc)) { // game_start
-
-            // init board state
-            int i;
-            char* pIBoard = INITIAL_BOARD;
-            for (i = 0; i < 8; i++) {
-                char row[9];
-                sscanf(pIBoard, "%8[^\n]\n", row);
-                memcpy(board[i], row, 8);
-                pIBoard += 9;
-            }
-
-            nextTurn(&turn, clients, board); // turn 1 start
-        }
+        } 
     }
+
+    END_GAME:
+    int red, blue;
+    getUnitCnt(board, &red, &blue);
 
     json_t* req = json_object();
     json_t* scores = json_object();
     SET_STR(req, "type", "game_over");
-    SET_INT(scores, clients[0].username, clients[0].score);
-    SET_INT(scores, clients[1].username, clients[1].score);
+    SET_INT(scores, clients[0].username, red);
+    SET_INT(scores, clients[1].username, blue);
     SET_OBJ(req, "scores", scores);
+    LOGG("==========Game Over===========\n");
+    printBoard(board);
+    LOGG("%s\t\t%d\n", clients[0].username, red);
+    LOGG("%s\t\t%d\n", clients[1].username, blue);
     
     int i;
     for (i = 0; i < 2; i++) {
@@ -292,13 +308,13 @@ int main() {
             close(client);
         }
     }
-    consume(2, req, scores);
+    consume(1, &req);
     close(socket);
     return err;
 }
 
 #pragma region GAME_PROC
-bool registerPlayer(const int sockfd, json_t* req, int client, Client* pclients, const bool gameProc) {
+bool registerPlayer(json_t* req, int client, Client* pclients, const bool gameProc) {
     // req will be freed outside. pclients will be disconnected outside.
 
     bool ret = TRUE;
@@ -315,14 +331,15 @@ bool registerPlayer(const int sockfd, json_t* req, int client, Client* pclients,
         } else {
             // existing username check
             bool overlap = FALSE;
-            int filled = 0;
+            int filled = 100;
             for (i = 0; i < 2; i++) {
                 if (*(pclients[i].pfd) != -1 && pclients[i].status == CONNECTED) { // for connected user
-                    filled++;
                     if (SAME_STR(username, pclients[i].username)) {
                         overlap = TRUE;
-                        break;
                     }
+                } else if (pclients[i].status == DISCONNECTED) {
+                    if (i < filled)
+                        filled = i;
                 }
             }
 
@@ -333,7 +350,7 @@ bool registerPlayer(const int sockfd, json_t* req, int client, Client* pclients,
                 SET_STR(req, "reason", "invalid");
 
                 sendJson(client, req);
-                consume(1, req);
+                consume(1, &req);
 
                 ret = FALSE;
             } else {
@@ -342,7 +359,7 @@ bool registerPlayer(const int sockfd, json_t* req, int client, Client* pclients,
                 SET_STR(req, "type", "register_ack");
 
                 int res = sendJson(client, req);
-                consume(1, req);
+                consume(1, &req);
                 
                 if (res <= 0) {
                     // err
@@ -358,10 +375,22 @@ bool registerPlayer(const int sockfd, json_t* req, int client, Client* pclients,
         }
     }
 
-    frees(1, username);
+    frees(1, &username);
     if (!ret)
-        LOGG("[register failed]");
+        LOGG("[register failed]\n");
     return ret;
+}
+void reject(const int client) {
+    LOGG("[user rejected: full]\n");
+
+    json_t* req = json_object();
+    SET_STR(req, "type", "register_nack");
+    SET_STR(req, "reason", "invalid");
+
+    sendJson(client, req);
+    consume(1, &req);
+
+    close(client);
 }
 bool gameStart(Client* pclients, bool* gameProc) {
     // game-start
@@ -389,8 +418,8 @@ bool gameStart(Client* pclients, bool* gameProc) {
         }
     }
 
-    consume(2, players, res);
-    frees(1, resString);
+    consume(1, &res);
+    frees(1, &resString);
 
     if (ret) {
         LOGG("[game start]\n");
@@ -409,12 +438,16 @@ void nextTurn(int* curTurn, Client* pclients, const TILE board[8][8]) {
     SET_ARR(req, "board", boardArr);
 
     (*curTurn)++;
+    if (pclients[CUR_IDX(*curTurn)].status == DISCONNECTED){
+        LOGG("[turn skipped: %s]\n", pclients[CUR_IDX(*curTurn)].username);
+        (*curTurn)++;
+    }
 
     sendJson(*(pclients[CUR_IDX(*curTurn)].pfd), req);
-    consume(2, req, boardArr);
+    consume(1, &req);
     pclients[CUR_IDX(*curTurn)].timer = clock(); // start timer
 
-    LOGG("[turn: %s -> %s]\n", pclients[NXT_IDX(*curTurn)].username, pclients[CUR_IDX(*curTurn)].username);
+    LOGG("[turn: %s]\n", pclients[CUR_IDX(*curTurn)].username);
 }
 void flip(const int x, const int y, const TILE cur, TILE board[8][8]) {
     int i, j;
@@ -425,7 +458,7 @@ void flip(const int x, const int y, const TILE cur, TILE board[8][8]) {
             const size_t aroundRow = y + i;
             TILE* sur;
 
-            if (!IN_RANGE(aroundRow, 1, 8) || !IN_RANGE(aroundCol, 1, 8)) { // map boundary
+            if (!IN_RANGE(aroundRow, 1, 8) || !IN_RANGE(aroundCol, 1, 8)) { // board boundary
                 continue;
             } else if (*(sur = &board POS(aroundCol, aroundRow)) != EMPTY && *sur != WALL && *sur != cur ) { // check surround
                 *sur = cur;
@@ -433,21 +466,21 @@ void flip(const int x, const int y, const TILE cur, TILE board[8][8]) {
         }
     }
 }
-void validation(const int curTurn, Client* pclients, TILE board[8][8], json_t* movereq) {
-    char* username = NULL;
+void validation(const int curTurn, Client* pclients, TILE board[8][8], json_t* movereq, bool* pass) {
+    const char* username = NULL;
     int sx, sy, tx, ty;
     const int client = *(pclients[CUR_IDX(curTurn)].pfd);
 
     bool isValid = TRUE;
     bool notTurn = FALSE;
     if (IS_STR_F(movereq, "username") && IS_INT_F(movereq, "sx") && IS_INT_F(movereq, "sy") && IS_INT_F(movereq, "tx") && IS_INT_F(movereq, "ty")) {
-        const char* fUsername = GET_STR(movereq, "username");
-        username = strdup(fUsername);
+        username = GET_STR(movereq, "username");
         sx = GET_INT(movereq, "sx"); sy = GET_INT(movereq, "sy");
         tx = GET_INT(movereq, "tx"); ty = GET_INT(movereq, "ty");
 
+        LOGG("[user try to move: %d %d -> %d %d]\n", sx, sy, tx, ty);
         if (!SAME_STR(username, pclients[CUR_IDX(curTurn)].username)) {
-            LOGG("[validation: invalid username]\n");
+            LOGG("[validation: turn %s but %s]\n", pclients[CUR_IDX(curTurn)].username, username); 
             notTurn = TRUE;
             isValid = FALSE;
         } else {
@@ -466,7 +499,7 @@ void validation(const int curTurn, Client* pclients, TILE board[8][8], json_t* m
                                     if (!(x == 0 || y == 0 || x == y || x == -y) || !IN_RANGE(i + y, 0, 7) || !IN_RANGE(j + x, 0, 7))
                                         continue;
                                     else if (board[i + y][j + x] == EMPTY){
-                                        LOG("nump failed\n");
+                                        LOG("jump failed\n");
                                         isValid = FALSE;
                                         goto INVALID; // invalid pass
                                     }
@@ -475,30 +508,41 @@ void validation(const int curTurn, Client* pclients, TILE board[8][8], json_t* m
                         }
                     }
                 }
+                *pass = TRUE;
             } else if (!IN_RANGE(sx, 1, 8) || !IN_RANGE(sy, 1, 8) || !IN_RANGE(tx, 1, 8) || !IN_RANGE(ty, 1, 8)) {
                 isValid = FALSE;
-                goto INVALID; // map out
-            } 
-
-            if (board POS(sx, sy) != cur || board POS(tx, ty) != EMPTY) {
-                isValid = FALSE;
-                goto INVALID; // invalid tile
-            }else if (IN_RANGE(gap[0], -1, 1) && IN_RANGE(gap[1], -1, 1)) {
-                board POS(sx, sy) = EMPTY;
-                flip(tx, ty, cur, board);
-            } else if (IN_RANGE(gap[0], -2, 2) && IN_RANGE(gap[1], -2, 2) && (gap[0] == 0 || gap[1] == 0 || gap[1] == gap[0] || gap[1] == -gap[0])) {
-                flip(tx, ty, cur, board);
+                goto INVALID; // board out
+            } else {
+                    if (board POS(sx, sy) != cur || board POS(tx, ty) != EMPTY) {
+                    isValid = FALSE;
+                    goto INVALID; // invalid tile
+                }else if (IN_RANGE(gap[0], -1, 1) && IN_RANGE(gap[1], -1, 1)) {
+                    // clone
+                    board POS(tx, ty) = cur;
+                    flip(tx, ty, cur, board);
+                } else if (IN_RANGE(gap[0], -2, 2) && IN_RANGE(gap[1], -2, 2) && (gap[0] == 0 || gap[1] == 0 || gap[1] == gap[0] || gap[1] == -gap[0])) {
+                    // jump
+                    board POS(sx, sy) = EMPTY;
+                    board POS(tx, ty) = cur;
+                    flip(tx, ty, cur, board);
+                } else {
+                    isValid = FALSE;
+                    goto INVALID;
+                }
             }
 
             // TODO: validation
             json_t* req = json_object();
             json_t* arr = getBoardJson(board);
+
             SET_STR(req, "type", "move_ok");
-            SET_STR(req, "next_player", pclients[(curTurn + 1) % 2].username);
+            SET_STR(req, "next_player", pclients[NXT_IDX(curTurn)].username);
             SET_ARR(req, "board", arr);
 
             sendJson(client, req);
-            consume(2, req, arr);
+            consume(1, &req);
+
+            *pass = FALSE;
 
             LOGG("[validation: move ok]\n");
         }
@@ -514,19 +558,20 @@ void validation(const int curTurn, Client* pclients, TILE board[8][8], json_t* m
         } else {
             SET_STR(req, "next_player", pclients[NXT_IDX(curTurn)].username);
             arr = getBoardJson(board);
+    
             SET_ARR(req, "board", arr);
+
+            LOGG("[validation: invalid move]\n");
         }
 
         sendJson(client, req);
-        consume(2, req, arr);
+        consume(1, &req);
 
-        LOGG("[validation: invalid move]\n");
     }
-    
-    frees(1, username);
 }
 json_t* getBoardJson(const TILE board[8][8]) {
     json_t* arr = json_array();
+
     int i;
     for (i = 0; i < 8; i++) {
         char row[9];
@@ -570,6 +615,9 @@ bool setNetwork(int* sockfd) {
         return FALSE;
     }
 
+    freeaddrinfo(res);
+
+
     return TRUE;
 }
 void disconnect(int* sockfd, STATUS* status) {
@@ -587,6 +635,8 @@ bool parse(json_t** json, const char* input) {
     *json = json_loads(input, 0, &error);
 
     if (!*json) {
+        LOGG("fail parse %p\n", *json);
+        consume(1, &(*json));
         LOG("Parse error: %s (line %d)\n", error.text, error.line);
         return FALSE;
     }
@@ -624,7 +674,7 @@ int sendJson(const int dst, json_t* data) {
 
     ssize_t sent = sendStr(dst, payload);
 
-    frees(1, payload);
+    frees(1, &payload);
     if (sent <= 0) {
         return -1;
     }
@@ -654,87 +704,43 @@ void consume(int num, ...) {
     va_start(ap, num);
     
     for (i = 0; i < num; i++) {
-        json_t* json = va_arg(ap, json_t*);
+        json_t** json = va_arg(ap, json_t**);
 
-        if (!json) {
-            json_decref(json);
+         if (*json == NULL || IS_NULL(*json)) {
+            continue;
         }
+
+        json_decref(*json);
+        *json = NULL;
     }
     va_end(ap);
 }
-json_t* recvPayload(const int src) {
-    static USING_RESPONSE_BUFFER(buffer);
-    static ssize_t len = 0;
+json_t* recvPayload(const int src)
+{
+    // take only one payload
+    USING_RESPONSE_BUFFER(buffer);
 
-    bool invalid = FALSE;
-    char *pnl, *bnl;
-    char* payload = NULL;
-
-    do {
-        if (len == PAYLOAD_BUFFER - 1) len = 0; // excessive payload
-        len += recv(src, buffer + len, sizeof(buffer) - len - 1, 0);
-        if (len <= 0) {
-            invalid = TRUE;
-            break;
-        }
-        buffer[len] = '\0'; // for separated stream's end
-        
-        // inefficient but not bad at most case
-        ssize_t newLen = len + 1;
-        char* payloadBuffer = NULL;
-
-        if (payload) {
-            size_t payloadLen = strlen(payload);
-            payloadBuffer = (char*)malloc(payloadLen + 1);
-            if (!payloadBuffer) { // memory issue
-                invalid = TRUE;
-                break;
-            }
-            strcpy(payloadBuffer, payload); // save prev payload
-
-            newLen += (ssize_t)payloadLen;
-            free(payload);
-            payload = NULL;
-        }
-
-        payload = (char*)malloc(newLen);
-        payload[0] = '\0';
-        if (!payload) { // memory issue;
-            invalid = TRUE;
-            break;
-        }
-        if (payloadBuffer) {
-            strcpy(payload, payloadBuffer);
-            free(payloadBuffer);
-        };
-        strcat(payload, buffer);
-
-    } while (!(pnl = strchr(payload, '\n')));
-    // payload: (short~long payload stream)\n(short payload stream or not)
-
-    if (!invalid) {
-        *pnl = '\0';
-        bnl = strchr(buffer, '\n'); // have to contain \n since while is broken on new payload has \n.
-        *bnl = '\0';
-
-        json_t* json;
-        if (parse(&json, payload)) {
-            free(payload);
-
-            ssize_t processed = bnl - buffer + 1;
-            memmove(buffer, buffer + processed, len - processed);
-            len -= processed;
-            buffer[len] = '\0';
-
-            return json;
-        }  else if (payload) {
-            free(payload);
-        }
+    char *nl;
+    int n = recv(src, buffer, PAYLOAD_BUFFER, MSG_PEEK);
+    if (n <= 0) {
         return json_null();
-    } else if (payload) {
-        free(payload);
     }
-    return json_null();
+    
+    buffer[n] = '\0';
+    
+    nl = strchr(buffer, '\n');
+
+    n = recv(src, buffer, (nl - buffer) + 1, 0);
+    if (n <= 0) {
+        return json_null();
+    }
+
+    *nl = '\0';
+    json_t *json;
+    if (!parse(&json, buffer))
+        return json_null();
+    
+    return json;
 }
 #pragma endregion
 
@@ -748,12 +754,60 @@ void frees(int num, ...)
     va_start(ap, num);
     
     for (i = 0; i < num; i++) {
-        void* ptr = va_arg(ap, void *);
+        void** ptr = va_arg(ap, void**);
 
-        if (ptr != NULL) {
-            free(ptr);
+        if (*ptr != NULL) {
+            free(*ptr);
+            *ptr = NULL;
         }
     }
     va_end(ap);
+}
+void printBoard(const TILE pboard[8][8]) {
+    int i;
+    int j;
+
+    for (i = 0; i < 8; i++) {
+        for (j = 0; j < 8; j++) {
+            putchar(pboard[i][j]);
+        }
+        printf("\n");
+    }
+}
+void initBoard(TILE board[8][8]) {
+    int i;
+    char* pIBoard = INITIAL_BOARD;
+    for (i = 0; i < 8; i++) {
+        char row[10];
+        sscanf(pIBoard, "%8[^\n]\n", row);
+        memcpy(board[i], row, 8);
+        pIBoard += 9;
+    }
+}
+bool isFullBoard(const TILE board[8][8]) {
+    int i, j;
+
+    for (i = 0; i < 8; i++)
+        for (j = 0; j < 8; j++)
+            if (board[i][j] == EMPTY)
+                return FALSE;
+
+    return TRUE;
+}
+void getUnitCnt(const TILE board[8][8], int* pred, int* pblue) {
+    int i, j;
+    int red = 0, blue = 0;
+
+    for (i = 0; i < 8; i++) {
+        for (j = 0; j < 8; j++) {
+            if (board[i][j] == RED)
+                red++;
+            else if (board[i][j] == BLUE)
+                blue++;
+        }
+    }
+
+    *pred = red;
+    *pblue = blue;
 }
 #pragma endregion

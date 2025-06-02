@@ -11,10 +11,6 @@
 
 #pragma region MACRO_TCP
 #define USING_RESPONSE_BUFFER(x)            char x[PAYLOAD_BUFFER]
-#define RECV(x, y)                          recv(x, y, sizeof(y) - 1, 0)
-#define RECV_TO(to, x, y)                   int to = RECV(x, y);y[to] = '\0'
-#define SEND(x, y)                          send(x, y, strlen(y), 0)
-#define SEND_TO(to, x, y)                   int to = SEND(x, y)
 #pragma endregion
 
 #pragma region MACRO_JSON
@@ -64,11 +60,11 @@
 #pragma endregion
 
 #ifdef DEBUG
-#define LOG(format, ...)                    printf(format, ##__VA_ARGS__)
+#define LOG(format, args...)                    printf(format, ##args)
 #else
-#define LOG(format, ...)
+#define LOG(format, args...)                    
 #endif
-#define LOGG(format, ...)                   printf(format, ##__VA_ARGS__) // gloabl logging
+#define LOGG(format, args...)                   printf(format, ##args) // gloabl logging
 
 #pragma region CONSTS
 #define TRUE                        1
@@ -80,6 +76,7 @@
 
 #pragma region MACRO_UTIL
 #define SAME_STR(x, y)                      (x != NULL && y != NULL && !strcmp((x), (y)))
+#define IN_RANGE(x, min, max)   ((x) >= min && (x) <= max)
 #pragma endregion
 
 #pragma region  TYPEDEF
@@ -87,11 +84,17 @@ typedef struct pollfd sPollFD;
 typedef struct addrinfo sAddrinfo;
 typedef char bool;
 typedef char TILE;
+typedef struct {
+    int sx, sy, tx, ty;
+} Move;
+
+typedef enum { WAIT_START, WAIT_TURN, WAIT_MOVE_ACK } STATUS;
 #pragma endregion
 
 #pragma region FUNC_DECL
 
 void frees(int num, ...);
+void printMap(TILE pmap[8][8]);
 
 bool parse(json_t** json, const char* input);
 char* stringfy(json_t** json);
@@ -103,12 +106,32 @@ json_t* recvPayload(const int src);
 bool executionCheck(int argc, char* argv[], const char** pip, const char** pport, const char** pname);
 bool setNetwork(const char* ip, const char* port, int* sockfd);
 bool registerPlayer(const int sockfd, const char* username);
-bool gameStart(const int sockfd);
-json_t* getReqType(const int sockfd, char** ptype);
-void move_generate(json_t* movereq, const TILE board[8][8]);
+bool gameStart(const int sockfd, bool* meFirst, const char* myname);
+char* extractType(const json_t* json);
+void move_generate(json_t* movereq, const TILE board[8][8], const bool meFirst);
 #pragma endregion
 
+int popRequestQueue(sPollFD* fds, int num, int timeout, json_t** out) {
+    int i;
+
+    int ready = poll(fds, num, timeout);
+    if (ready < 0) {
+        return -1;
+    } else {
+        for (i = 0; i < num; i++) {
+            int src = fds[i].fd;
+            if (fds[i].revents & POLLIN) {
+                *out = recvPayload(src);
+                return i;
+            }
+        }
+    }
+
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
+    srand((unsigned int)time(NULL));
     const char* ip;
     const char* port;
     const char* username;
@@ -117,9 +140,10 @@ int main(int argc, char* argv[]) {
         return 1;
 
     int socket;
-    bool res;
     sPollFD server;
     bool err = FALSE;
+    STATUS status;
+    bool meFirst;
 
     if (!setNetwork(ip, port, &socket)) {
         LOGG("[netset error]\n");
@@ -133,43 +157,88 @@ int main(int argc, char* argv[]) {
     server.fd = socket;
     server.events = POLLIN;
 
-    if (gameStart(socket)) {
+    status = WAIT_START;
+
+    if (status == WAIT_START && gameStart(socket, &meFirst, username)) {
+        status = WAIT_TURN;
         while (1) {
-            int ready = poll(&server, 1, 0);
-            if (ready == -1) { // poll err
+            json_t* req;
+            TILE board[8][8];
+            int queueIdx = popRequestQueue(&server, 1, -1, &req);
+            if (queueIdx < 0) {
                 err = TRUE;
                 break;
-            } else if (server.revents & POLLIN) {
-                char* type;
-                json_t* req = getReqType(socket, &type);
+            }
 
-                if (IS_NULL(req)) {
-                    err = TRUE;
-                    break;
-                } else if (SAME_STR(type, "your_turn")) {
-                    // move
-                    
-                    sleep(2);
-
-                    json_t* movereq = json_object();
-                    SET_STR(movereq, "type", "move");
-                    SET_STR(movereq, "username", "000");
-                    
-
-                    sendJson(socket, movereq);
-                    consume(1, movereq);
-                } else if (SAME_STR(type, "move_ok")) {
-                    LOG("move ok\n");
-                } else if (SAME_STR(type, "invalid_move")) {
-                    LOG("invalid move\n");
-                } else if (SAME_STR(type, "pass")) {
-                    LOG("pass\n");
+            char* type = extractType(req);
+            if (!type) {
+                LOGG("[network error]\n");
+                err = TRUE;
+                break;
+            } else if (status == WAIT_TURN && SAME_STR(type, "your_turn")) {
+                // move
+                LOGG("[my turn: %s]\n", username);
+                json_t* res = GET_ARR(req, "board");
+                int i;
+                
+                for (i = 0; i < 8; i++) {
+                    memcpy(board[i], TO_STR(GET_IDX(res, i)), 8);
                 }
+
+                json_t* movereq = json_object();
+                SET_STR(movereq, "type", "move");
+                SET_STR(movereq, "username", username);
+                
+                clock_t st = clock();
+                move_generate(movereq, board, meFirst);
+                LOGG("[move to %d %d]\n", (int)GET_INT(movereq, "tx"), (int)GET_INT(movereq, "ty"));
+                clock_t en = clock();
+
+                if ((double)(en - st) / CLOCKS_PER_SEC <= 5.0)
+                    sendJson(socket, movereq);
+                consume(1, movereq);
+                status = WAIT_MOVE_ACK;
+            } else if (status == WAIT_MOVE_ACK && SAME_STR(type, "move_ok")) {
+                LOG("move ok\n");
+                json_t* res = GET_ARR(req, "board");
+                int i;
+                
+                for (i = 0; i < 8; i++) {
+                    memcpy(board[i], TO_STR(GET_IDX(res, i)), 8);
+                }
+                printMap(board);
+                status = WAIT_TURN;
+            } else if (status == WAIT_MOVE_ACK && SAME_STR(type, "invalid_move")) {
+                LOG("invalid move\n");
+                json_t* res = GET_ARR(req, "board");
+                if (!IS_ARR(res))
+                    continue;
+                int i;
+                
+                for (i = 0; i < 8; i++) {
+                    memcpy(board[i], TO_STR(GET_IDX(res, i)), 8);
+                }
+                printMap(board);
+                status = WAIT_TURN;
+            } else if (status == WAIT_MOVE_ACK && SAME_STR(type, "pass")) {
+                LOG("pass\n");
+                printMap(board);
+                status = WAIT_TURN;
+            } else if (SAME_STR(type, "game_over")) {
+                json_t* scores = GET_OBJ(req, "scores");
+                int my = GET_INT(scores, username);
+
+                LOGG("==========Game Over===========\n");
+                printMap(board);
+                LOGG("%s's score: %d\n", username, my);
 
                 frees(1, type);
                 consume(1, req);
+                break;
             }
-            
+
+            frees(1, type);
+            consume(1, req);
         }
     } else err = TRUE;
     
@@ -236,13 +305,13 @@ bool registerPlayer(const int sockfd, const char* username) {
     int res = sendJson(sockfd, dto);
     if (res > 0) {
         // recv register_ack
-        req = getReqType(sockfd, &type);
-        if (!IS_NULL(req) && SAME_STR(type, "register_ack")) {
+        req = recvPayload(sockfd);
+        type = extractType(req);
+        if (!IS_NULL(req) && type && SAME_STR(type, "register_ack")) {
             ret = TRUE;
             LOGG("[registered]\n");
         }
     }
-
 
     // err or register_nack
     consume(2, dto, req);
@@ -250,20 +319,28 @@ bool registerPlayer(const int sockfd, const char* username) {
 
     return ret;
 }
-bool gameStart(const int sockfd) {
+bool gameStart(const int sockfd, bool* meFirst, const char* myname) {
     bool ret = FALSE;
     char *type = NULL, *first_player = NULL;
-    json_t* res = getReqType(sockfd, &type);
+    json_t* res;
     json_t* players;
 
-    if (!IS_NULL(res) && IS_STR_F(res, "first_player") && IS_ARR_F(res, "players")) {
+    res = recvPayload(sockfd);
+    type = extractType(res);
+
+    if (!IS_NULL(res) && IS_STR_F(res, "first_player") && IS_ARR_F(res, "players") && type) {
         const char* fFirst_player = GET_STR(res, "first_player");
         first_player = strdup(fFirst_player);
 
         players = GET_ARR(res, "players");
 
-        if (LEN_ARR(players) == 2 && IS_STR(GET_IDX(players, 0)) && IS_STR(GET_IDX(players, 1)) && SAME_STR(type, "game_start") && !SAME_STR(TO_STR(GET_IDX(players, 0)), "") && !SAME_STR(TO_STR(GET_IDX(players, 1)), "") && !SAME_STR(first_player, "")) {
+        if (first_player && LEN_ARR(players) == 2 && IS_STR(GET_IDX(players, 0)) && IS_STR(GET_IDX(players, 1)) && SAME_STR(type, "game_start") && !SAME_STR(TO_STR(GET_IDX(players, 0)), "") && !SAME_STR(TO_STR(GET_IDX(players, 1)), "") && !SAME_STR(first_player, "")) {
             LOG("[game start]\n");
+            if (SAME_STR(TO_STR(GET_IDX(players, 0)), myname))
+                *meFirst = TRUE;
+            else
+                *meFirst = FALSE;
+
             ret = TRUE;
         }
     }
@@ -272,13 +349,70 @@ bool gameStart(const int sockfd) {
     consume(1, res);
     return ret;
 }
-void move_generate(json_t* movereq, const TILE board[8][8]) {
-    srand((unsigned int)time(NULL));
+void move_generate(json_t* movereq, const TILE board[8][8], const bool meFirst) {
+    const char myTile = (meFirst ? 'R' : 'B');
 
-    SET_INT(movereq, "sx", rand() % 9);
-    SET_INT(movereq, "sy", rand() & 9);
-    SET_INT(movereq, "tx", rand() % 9);
-    SET_INT(movereq, "ty", rand() % 9);
+    Move *validMoves = malloc(sizeof(Move) * 512);
+    if (!validMoves) {
+        SET_INT(movereq, "sx", 9);
+        SET_INT(movereq, "sy", 9);
+        SET_INT(movereq, "tx", 9);
+        SET_INT(movereq, "ty", 9);
+        return;
+    }
+    int validCount = 0;
+
+    for (int row = 0; row < 8; row++) {
+        for (int col = 0; col < 8; col++) {
+            if (board[row][col] != myTile) continue;
+
+            int sx = col + 1;
+            int sy = row + 1;
+
+            // clone
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (dx == 0 && dy == 0) continue;
+                    int tx = sx + dx;
+                    int ty = sy + dy;
+                    if (!IN_RANGE(tx, 1, 8) || !IN_RANGE(ty, 1, 8)) continue;
+                    if (board[ty-1][tx-1] != '.') continue;
+                    validMoves[validCount++] = (Move){sx, sy, tx, ty};
+                }
+            }
+            // jump
+            for (int dy = -2; dy <= 2; dy += 2) {
+                for (int dx = -2; dx <= 2; dx += 2) {
+                    if (dx == 0 && dy == 0) continue;
+                    int tx = sx + dx;
+                    int ty = sy + dy;
+                    if (!IN_RANGE(tx, 1, 8) || !IN_RANGE(ty, 1, 8)) continue;
+                    if (board[ty-1][tx-1] != '.') continue;
+                    validMoves[validCount++] = (Move){sx, sy, tx, ty};
+                }
+            }
+        }
+    }
+
+    // if invalid moves => pass
+    if (validCount == 0) {
+        SET_INT(movereq, "sx", 0);
+        SET_INT(movereq, "sy", 0);
+        SET_INT(movereq, "tx", 0);
+        SET_INT(movereq, "ty", 0);
+        free(validMoves);
+        return;
+    }
+
+    // select valid move
+    int idx = rand() % validCount;
+    Move sel = validMoves[idx];
+    SET_INT(movereq, "sx", sel.sx);
+    SET_INT(movereq, "sy", sel.sy);
+    SET_INT(movereq, "tx", sel.tx);
+    SET_INT(movereq, "ty", sel.ty);
+
+    frees(1, validMoves);
 }
 
 
@@ -356,109 +490,51 @@ void consume(int num, ...) {
     for (i = 0; i < num; i++) {
         json_t* json = va_arg(ap, json_t*);
 
-        if (!json) {
+        if (!IS_NULL(json)) {
             json_decref(json);
         }
     }
     va_end(ap);
 }
-json_t* recvPayload(const int src) {
-    static USING_RESPONSE_BUFFER(buffer);
-    static ssize_t len = 0;
 
-    bool invalid = FALSE;
-    char *pnl, *bnl;
-    char* payload = NULL;
+json_t* recvPayload(const int src)
+{
+    // take only one payload
+    USING_RESPONSE_BUFFER(buffer);
 
-    do {
-        if (len == PAYLOAD_BUFFER - 1) len = 0; // excessive payload
-        len += recv(src, buffer + len, sizeof(buffer) - len - 1, 0);
-        if (len <= 0) {
-            invalid = TRUE;
-            break;
-        }
-        buffer[len] = '\0'; // for separated stream's end
-        
-        // inefficient but not bad at most case
-        ssize_t newLen = len + 1;
-        char* payloadBuffer = NULL;
-
-        if (payload) {
-            size_t payloadLen = strlen(payload);
-            payloadBuffer = (char*)malloc(payloadLen + 1);
-            if (!payloadBuffer) { // memory issue
-                invalid = TRUE;
-                break;
-            }
-            strcpy(payloadBuffer, payload); // save prev payload
-
-            newLen += (ssize_t)payloadLen;
-            free(payload);
-            payload = NULL;
-        }
-
-        payload = (char*)malloc(newLen);
-        payload[0] = '\0';
-        if (!payload) { // memory issue;
-            invalid = TRUE;
-            break;
-        }
-        if (payloadBuffer) {
-            strcpy(payload, payloadBuffer);
-            free(payloadBuffer);
-        };
-        strcat(payload, buffer);
-
-    } while (!(pnl = strchr(payload, '\n')));
-    // payload: (short~long payload stream)\n(short payload stream or not)
-
-    if (!invalid) {
-        *pnl = '\0';
-        bnl = strchr(buffer, '\n'); // have to contain \n since while is broken on new payload has \n.
-        *bnl = '\0';
-
-        json_t* json;
-        if (parse(&json, payload)) {
-            free(payload);
-
-            ssize_t processed = bnl - buffer + 1;
-            memmove(buffer, buffer + processed, len - processed);
-            len -= processed;
-            buffer[len] = '\0';
-
-            return json;
-        }  else if (payload) {
-            free(payload);
-        }
+    char *nl;
+    int n = recv(src, buffer, PAYLOAD_BUFFER, MSG_PEEK);
+    if (n <= 0) {
         return json_null();
-    } else if (payload) {
-        free(payload);
     }
-    return json_null();
+    
+    buffer[n] = '\0';
+    
+    nl = strchr(buffer, '\n');
+
+    n = recv(src, buffer, (nl - buffer) + 1, 0);
+    if (n <= 0) {
+        return json_null();
+    }
+
+    *nl = '\0';
+    json_t *json;
+    if (!parse(&json, buffer))
+        return json_null();
+    
+    return json;
 }
-json_t* getReqType(const int sockfd, char** ptype) {
-    bool invalid = FALSE;
-    json_t* req = recvPayload(sockfd);
-    char* type = NULL;
-    if (IS_NULL(req)) {
-        LOGG("[network error]\n");
-        invalid = TRUE;
-    } else if (IS_STR_F(req, "type")) {
-        const char* fType = GET_STR(req, "type");
+char* extractType(const json_t* json) {
+    if (IS_NULL(json)) {
+        return NULL;
+    } else if (IS_STR_F(json, "type")) {
+        char* type;
+        const char* fType = GET_STR(json, "type");
         type = strdup(fType);
 
-        if (type == NULL) {
-            LOG("type is null\n");
-            invalid = TRUE;
-        }
-    } else invalid = TRUE;
-
-    if (invalid) {
-        *ptype = NULL;
-        return json_null();
+        return type;
     }
-    *ptype = type;
-    return req;
+    return NULL;
 }
 #pragma endregion
 
@@ -479,5 +555,16 @@ void frees(int num, ...)
         }
     }
     va_end(ap);
+}
+void printMap(TILE pmap[8][8]) {
+    int i;
+    int j;
+
+    for (i = 0; i < 8; i++) {
+        for (j = 0; j < 8; j++) {
+            putchar(pmap[i][j]);
+        }
+        printf("\n");
+    }
 }
 #pragma endregion
