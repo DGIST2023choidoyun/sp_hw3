@@ -277,7 +277,11 @@ int main() {
                 sendJson(*(clients[CUR_IDX(turn)].pfd), req); // disconnection will be delegated
                 consume(1, &req);
 
+                bool prevPass = pass;
                 pass = TRUE;
+                if (pass && prevPass) {
+                    break;
+                }
                 
                 nextTurn(&turn, clients, board);
             }
@@ -438,10 +442,11 @@ void nextTurn(int* curTurn, Client* pclients, const TILE board[8][8]) {
     SET_ARR(req, "board", boardArr);
 
     (*curTurn)++;
-    if (pclients[CUR_IDX(*curTurn)].status == DISCONNECTED){
-        LOGG("[turn skipped: %s]\n", pclients[CUR_IDX(*curTurn)].username);
-        (*curTurn)++;
-    }
+    // ----- depricated -----
+    // if (pclients[CUR_IDX(*curTurn)].status == DISCONNECTED){
+    //     LOGG("[turn skipped: %s]\n", pclients[CUR_IDX(*curTurn)].username);
+    //     (*curTurn)++;
+    // }
 
     sendJson(*(pclients[CUR_IDX(*curTurn)].pfd), req);
     consume(1, &req);
